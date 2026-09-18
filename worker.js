@@ -1,11 +1,10 @@
 // Cloudflare Worker — mfm-leaderboards
-// Paste this into Cloudflare Dashboard → Workers → your worker → Edit code
+// Env vars needed: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, LB_SECRET
 
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
 
-        // CORS headers
         const corsHeaders = {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -16,113 +15,92 @@ export default {
             return new Response(null, { headers: corsHeaders });
         }
 
-        // POST /submit — game submits score
+        // POST /submit — verify HMAC + write score
         if (request.method === 'POST' && url.pathname === '/submit') {
             try {
                 const body = await request.json();
-                const { user_id, name, score, chapter, stage } = body;
+                const { uid, p, name } = body;
 
-                // Validate
-                if (!user_id || !name || typeof score !== 'number' || score < 0 || score > 9999999) {
-                    return new Response('Invalid', { status: 400, headers: corsHeaders });
+                if (!uid || !p || !name) {
+                    return new Response(JSON.stringify({ error: 'Missing fields' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
                 }
-                if (name.length > 20 || user_id.length > 30) {
-                    return new Response('Too long', { status: 400, headers: corsHeaders });
+                if (uid.length > 30 || name.length > 20) {
+                    return new Response(JSON.stringify({ error: 'Too long' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
                 }
 
-                // Write to Firebase using REST API with service account
-                const projectId = env.FIREBASE_PROJECT_ID;
-                const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-                const privateKey = env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+                // Verify HMAC
+                const payload = await verifyPayload(p, env.LB_SECRET);
+                if (!payload) {
+                    return new Response(JSON.stringify({ error: 'Invalid signature' }), { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+                }
 
-                // Get access token
-                const token = await getAccessToken(clientEmail, privateKey);
+                // Check if user already exists
+                const existing = await firebaseGet(uid, env);
 
-                // Write document
-                const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/scores/${user_id}`;
-                const docBody = {
-                    fields: {
-                        name: { stringValue: name },
-                        score: { integerValue: score.toString() },
-                        chapter: { integerValue: (chapter || 1).toString() },
-                        stage: { integerValue: (stage || 1).toString() },
+                // New user: check name uniqueness
+                if (!existing) {
+                    const nameTaken = await firebaseQueryByName(name, env);
+                    if (nameTaken) {
+                        return new Response(JSON.stringify({ error: 'name_taken' }), { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
                     }
-                };
-
-                const firestoreRes = await fetch(docUrl, {
-                    method: 'PATCH',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(docBody),
-                });
-
-                if (!firestoreRes.ok) {
-                    const err = await firestoreRes.text();
-                    return new Response(`Firestore error: ${err}`, { status: 500, headers: corsHeaders });
                 }
 
-                return new Response(JSON.stringify({ ok: true }), {
+                // Only update if score is higher or new user
+                if (existing) {
+                    if (payload.score <= existing.score) {
+                        return new Response(JSON.stringify({ error: 'score_not_higher', currentBest: existing.score }), { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+                    }
+                }
+
+                // Write to Firebase
+                await firebaseSet(uid, {
+                    name: name,
+                    score: payload.score,
+                    chapter: payload.ch,
+                    stage: payload.st,
+                }, env);
+
+                // Get rank
+                const rank = await firebaseGetRank(payload.score, env);
+
+                return new Response(JSON.stringify({ ok: true, rank }), {
                     status: 200,
                     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
                 });
 
             } catch (e) {
-                return new Response(`Error: ${e.message}`, { status: 500, headers: corsHeaders });
+                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
             }
         }
 
-        // GET /leaderboard — return top 100 scores
+        // POST /check-name — check if name is taken
+        if (request.method === 'POST' && url.pathname === '/check-name') {
+            try {
+                const body = await request.json();
+                const { name } = body;
+                if (!name) {
+                    return new Response(JSON.stringify({ error: 'Missing name' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+                }
+                const taken = await firebaseQueryByName(name, env);
+                return new Response(JSON.stringify({ taken }), {
+                    status: 200,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+            }
+        }
+
+        // GET /leaderboard — read-only (public)
         if (request.method === 'GET' && url.pathname === '/leaderboard') {
             try {
-                const projectId = env.FIREBASE_PROJECT_ID;
-                const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-                const privateKey = env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-
-                const token = await getAccessToken(clientEmail, privateKey);
-
-                // Query Firestore, ordered by score descending
-                const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/scores`;
-                const queryBody = {
-                    structuredQuery: {
-                        from: [{ collectionId: 'scores' }],
-                        orderBy: [{ field: { fieldPath: 'score' }, direction: 'DESCENDING' }],
-                        limit: 100,
-                    }
-                };
-
-                const res = await fetch(queryUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(queryBody),
-                });
-
-                if (!res.ok) {
-                    return new Response('[]', { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-                }
-
-                const data = await res.json();
-                const players = (data.document || []).map(doc => {
-                    const f = doc.fields || {};
-                    return {
-                        name: f.name?.stringValue || '???',
-                        score: parseInt(f.score?.integerValue || '0'),
-                        chapter: parseInt(f.chapter?.integerValue || '1'),
-                        stage: parseInt(f.stage?.integerValue || '1'),
-                    };
-                });
-
+                const players = await firebaseGetLeaderboard(env);
                 return new Response(JSON.stringify({ players }), {
                     status: 200,
                     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
                 });
-
             } catch (e) {
-                return new Response('[]', { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+                return new Response(JSON.stringify({ players: [] }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
             }
         }
 
@@ -130,7 +108,43 @@ export default {
     }
 };
 
-// JWT sign for Firebase service account
+// ============================================
+// HMAC verification (server-side)
+// ============================================
+async function verifyPayload(p, secret) {
+    const dot = p.lastIndexOf('.');
+    if (dot === -1) return null;
+    const dataB64 = p.substring(0, dot);
+    const sig = p.substring(dot + 1);
+    const data = base64Decode(dataB64);
+
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sigBytes = await crypto.subtle.sign('HMAC', key, enc.encode(data));
+    const expected = b64EncodeUrl(new Uint8Array(sigBytes));
+
+    if (sig !== expected) return null;
+    const parts = data.split('|');
+    if (parts.length !== 3) return null;
+    return { score: parseInt(parts[0]), ch: parseInt(parts[1]), st: parseInt(parts[2]) };
+}
+
+function base64Decode(b64) {
+    const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+    let s = '';
+    for (let i = 0; i < bin.length; i++) s += bin[i];
+    return s;
+}
+
+function b64EncodeUrl(bytes) {
+    let s = ''; bytes.forEach(b => s += String.fromCharCode(b));
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// ============================================
+// Firebase REST API helpers
+// ============================================
 async function getAccessToken(clientEmail, privateKey) {
     const now = Math.floor(Date.now() / 1000);
     const payload = {
@@ -176,4 +190,127 @@ function pemToArrayBuffer(pem) {
     const buffer = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
     return buffer.buffer;
+}
+
+async function getAuthHeader(env) {
+    const token = await getAccessToken(env.FIREBASE_CLIENT_EMAIL, env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'));
+    return `Bearer ${token}`;
+}
+
+// Read a document by ID
+async function firebaseGet(uid, env) {
+    const auth = await getAuthHeader(env);
+    const docUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores/${uid}`;
+    const res = await fetch(docUrl, { headers: { 'Authorization': auth } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.fields) return null;
+    return {
+        name: data.fields.name?.stringValue || '',
+        score: parseInt(data.fields.score?.integerValue || '0'),
+        chapter: parseInt(data.fields.chapter?.integerValue || '1'),
+        stage: parseInt(data.fields.stage?.integerValue || '1'),
+    };
+}
+
+// Write a document
+async function firebaseSet(uid, data, env) {
+    const auth = await getAuthHeader(env);
+    const docUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores/${uid}`;
+    const body = {
+        fields: {
+            name: { stringValue: data.name },
+            score: { integerValue: data.score.toString() },
+            chapter: { integerValue: (data.chapter || 1).toString() },
+            stage: { integerValue: (data.stage || 1).toString() },
+        }
+    };
+    await fetch(docUrl, {
+        method: 'PATCH',
+        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+}
+
+// Check if name is taken
+async function firebaseQueryByName(name, env) {
+    const auth = await getAuthHeader(env);
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
+    const queryBody = {
+        structuredQuery: {
+            from: [{ collectionId: 'scores' }],
+            where: {
+                fieldFilter: {
+                    field: { fieldPath: 'name' },
+                    op: 'EQUAL',
+                    value: { stringValue: name }
+                }
+            },
+            limit: 1,
+        }
+    };
+    const res = await fetch(queryUrl, {
+        method: 'POST',
+        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(queryBody),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return (data.document && data.document.length > 0) || (data/documents && data.documents.length > 0);
+}
+
+// Get rank for a score
+async function firebaseGetRank(score, env) {
+    const auth = await getAuthHeader(env);
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
+    const queryBody = {
+        structuredQuery: {
+            from: [{ collectionId: 'scores' }],
+            where: {
+                fieldFilter: {
+                    field: { fieldPath: 'score' },
+                    op: 'GREATER_THAN',
+                    value: { integerValue: score.toString() }
+                }
+            },
+            limit: 1000,
+        }
+    };
+    const res = await fetch(queryUrl, {
+        method: 'POST',
+        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(queryBody),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return (data.document || data.documents || []).length;
+}
+
+// Get top 100 leaderboard
+async function firebaseGetLeaderboard(env) {
+    const auth = await getAuthHeader(env);
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
+    const queryBody = {
+        structuredQuery: {
+            from: [{ collectionId: 'scores' }],
+            orderBy: [{ field: { fieldPath: 'score' }, direction: 'DESCENDING' }],
+            limit: 100,
+        }
+    };
+    const res = await fetch(queryUrl, {
+        method: 'POST',
+        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(queryBody),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.document || data.documents || []).map(doc => {
+        const f = doc.fields || {};
+        return {
+            name: f.name?.stringValue || '???',
+            score: parseInt(f.score?.integerValue || '0'),
+            chapter: parseInt(f.chapter?.integerValue || '1'),
+            stage: parseInt(f.stage?.integerValue || '1'),
+        };
+    });
 }
