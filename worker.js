@@ -236,75 +236,39 @@ async function firebaseSet(uid, data, env) {
 async function firebaseQueryByName(name, env) {
     const auth = await getAuthHeader(env);
     const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const queryBody = {
-        structuredQuery: {
-            from: [{ collectionId: 'scores' }],
-            where: {
-                fieldFilter: {
-                    field: { fieldPath: 'name' },
-                    op: 'EQUAL',
-                    value: { stringValue: name }
-                }
-            },
-            limit: 1,
-        }
-    };
-    const res = await fetch(queryUrl, {
-        method: 'POST',
-        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-        body: JSON.stringify(queryBody),
-    });
+    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
     if (!res.ok) return false;
     const data = await res.json();
-    return (data.document && data.document.length > 0) || (data/documents && data.documents.length > 0);
+    const docs = data.documents || [];
+    return docs.some(doc => {
+        const f = doc.fields || {};
+        return f.name?.stringValue === name;
+    });
 }
 
 // Get rank for a score
 async function firebaseGetRank(score, env) {
     const auth = await getAuthHeader(env);
     const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const queryBody = {
-        structuredQuery: {
-            from: [{ collectionId: 'scores' }],
-            where: {
-                fieldFilter: {
-                    field: { fieldPath: 'score' },
-                    op: 'GREATER_THAN',
-                    value: { integerValue: score.toString() }
-                }
-            },
-            limit: 1000,
-        }
-    };
-    const res = await fetch(queryUrl, {
-        method: 'POST',
-        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-        body: JSON.stringify(queryBody),
-    });
+    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
     if (!res.ok) return 0;
     const data = await res.json();
-    return (data.document || data.documents || []).length;
+    const docs = data.documents || [];
+    return docs.filter(doc => {
+        const f = doc.fields || {};
+        return parseInt(f.score?.integerValue || '0') > score;
+    }).length;
 }
 
 // Get top 100 leaderboard
 async function firebaseGetLeaderboard(env) {
     const auth = await getAuthHeader(env);
     const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const queryBody = {
-        structuredQuery: {
-            from: [{ collectionId: 'scores' }],
-            orderBy: [{ field: { fieldPath: 'score' }, direction: 'DESCENDING' }],
-            limit: 100,
-        }
-    };
-    const res = await fetch(queryUrl, {
-        method: 'POST',
-        headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
-        body: JSON.stringify(queryBody),
-    });
+    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
     if (!res.ok) return [];
     const data = await res.json();
-    return (data.document || data.documents || []).map(doc => {
+    const docs = data.documents || [];
+    const players = docs.map(doc => {
         const f = doc.fields || {};
         const docId = doc.name ? doc.name.split('/').pop() : '';
         return {
@@ -315,4 +279,6 @@ async function firebaseGetLeaderboard(env) {
             stage: parseInt(f.stage?.integerValue || '1'),
         };
     });
+    players.sort((a, b) => b.score - a.score);
+    return players.slice(0, 100);
 }
