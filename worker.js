@@ -15,6 +15,30 @@ export default {
             return new Response(null, { headers: corsHeaders });
         }
 
+        // POST /check-user — check if user exists (read-only, no write)
+        if (request.method === 'POST' && url.pathname === '/check-user') {
+            try {
+                const body = await request.json();
+                const { uid } = body;
+                if (!uid) {
+                    return new Response(JSON.stringify({ found: false }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+                }
+                const existing = await firebaseGet(uid, env);
+                if (existing) {
+                    return new Response(JSON.stringify({ found: true, ...existing }), {
+                        status: 200,
+                        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+                    });
+                }
+                return new Response(JSON.stringify({ found: false }), {
+                    status: 200,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ found: false }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+            }
+        }
+
         // POST /submit — verify HMAC + write score
         if (request.method === 'POST' && url.pathname === '/submit') {
             try {
