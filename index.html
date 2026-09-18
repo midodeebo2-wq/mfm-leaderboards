@@ -673,30 +673,22 @@
             const gameSt = payload.st;
             const container = document.getElementById('modalContainer');
 
-            // Check if user exists via worker
+            // Check if user exists
             let existing = null;
             try {
-                const checkRes = await fetch(`${WORKER_URL}/submit`, {
+                const checkRes = await fetch(`${WORKER_URL}/check-user`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ uid, p, name: '__check__' }),
+                    body: JSON.stringify({ uid }),
                 });
-                const checkData = await checkRes.json();
-                if (checkData.error === 'score_not_higher') {
-                    existing = { score: checkData.currentBest };
+                if (checkRes.ok) {
+                    const checkData = await checkRes.json();
+                    if (checkData.found) existing = checkData;
                 }
             } catch (e) {}
 
-            // Fetch existing data from leaderboard
-            try {
-                const lbRes = await fetch(`${WORKER_URL}/leaderboard`);
-                const lbData = await lbRes.json();
-                const match = (lbData.players || []).find(pl => pl.uid === uid);
-                if (match) existing = match;
-            } catch (e) {}
-
             // New user — ask for name
-            if (!existing || (existing && !existing.name)) {
+            if (!existing) {
                 container.innerHTML = `
                     <div class="modal-overlay">
                         <div class="modal">
