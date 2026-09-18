@@ -306,7 +306,9 @@ async function firebaseGetLeaderboard(env) {
     const data = await res.json();
     return (data.document || data.documents || []).map(doc => {
         const f = doc.fields || {};
+        const docId = doc.name ? doc.name.split('/').pop() : '';
         return {
+            uid: docId,
             name: f.name?.stringValue || '???',
             score: parseInt(f.score?.integerValue || '0'),
             chapter: parseInt(f.chapter?.integerValue || '1'),
