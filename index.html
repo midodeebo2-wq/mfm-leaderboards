@@ -559,19 +559,16 @@
 
     <div id="modalContainer"></div>
 
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
-    <script src="firebase-config.js"></script>
     <script>
-        firebase.initializeApp(firebaseConfig);
-        const db = firebase.firestore();
+        // Worker URL — update after deploying to Cloudflare Workers
+        const WORKER_URL = 'LEADERBOARD_WORKER_URL';
 
         async function fetchLeaderboard() {
             const body = document.getElementById('leaderboardBody');
             try {
-                const snap = await db.collection('scores').orderBy('score', 'desc').limit(100).get();
-                const players = [];
-                snap.forEach(doc => players.push(doc.data()));
+                const res = await fetch(`${WORKER_URL}/leaderboard`);
+                const data = await res.json();
+                const players = data.players || [];
 
                 if (players.length === 0) {
                     body.innerHTML = '<div class="empty-state"><div class="icon">&#127942;</div><p>No scores yet. Be the first!</p></div>';
@@ -609,22 +606,23 @@
 
         function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
         fetchLeaderboard();
-
+    </script>
+    <script>
         // ============================================
         // Handle game score submission via URL params
         // ============================================
         const LB_SECRET = 'mfm_lb_2026_s3cr3t';
 
-        function b64ToUint8Array(b64) {
-            const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
-            const arr = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-            return arr;
-        }
-
         function b64Encode(bytes) {
             let s = ''; bytes.forEach(b => s += String.fromCharCode(b));
             return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+        }
+
+        function base64Decode(b64) {
+            const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+            let s = '';
+            for (let i = 0; i < bin.length; i++) s += bin[i];
+            return s;
         }
 
         async function hmacSHA256(key, msg) {
@@ -633,13 +631,6 @@
                 { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
             const sig = await crypto.subtle.sign('HMAC', k, enc.encode(msg));
             return b64Encode(new Uint8Array(sig));
-        }
-
-        function base64Decode(b64) {
-            const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
-            let s = '';
-            for (let i = 0; i < bin.length; i++) s += bin[i];
-            return s;
         }
 
         async function verifyPayload(p) {
@@ -681,11 +672,31 @@
             const gameCh = payload.ch;
             const gameSt = payload.st;
             const container = document.getElementById('modalContainer');
-            const doc = await db.collection('scores').doc(uid).get();
-            const existing = doc.exists ? doc.data() : null;
+
+            // Check if user exists via worker
+            let existing = null;
+            try {
+                const checkRes = await fetch(`${WORKER_URL}/submit`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uid, p, name: '__check__' }),
+                });
+                const checkData = await checkRes.json();
+                if (checkData.error === 'score_not_higher') {
+                    existing = { score: checkData.currentBest };
+                }
+            } catch (e) {}
+
+            // Fetch existing data from leaderboard
+            try {
+                const lbRes = await fetch(`${WORKER_URL}/leaderboard`);
+                const lbData = await lbRes.json();
+                const match = (lbData.players || []).find(pl => pl.uid === uid);
+                if (match) existing = match;
+            } catch (e) {}
 
             // New user — ask for name
-            if (!existing) {
+            if (!existing || (existing && !existing.name)) {
                 container.innerHTML = `
                     <div class="modal-overlay">
                         <div class="modal">
@@ -705,30 +716,39 @@
                         document.getElementById('nameError').style.display = 'block';
                         return;
                     }
-                    const nameCheck = await db.collection('scores').where('name', '==', name).limit(1).get();
-                    if (!nameCheck.empty) {
-                        const err = document.getElementById('nameError');
-                        err.textContent = 'This name is already taken!';
-                        err.style.display = 'block';
-                        const input = document.getElementById('nameInput');
-                        input.style.borderColor = '#ff6b6b';
-                        input.style.animation = 'shake 0.4s ease';
-                        setTimeout(() => { input.style.animation = ''; }, 400);
-                        return;
+                    try {
+                        const res = await fetch(`${WORKER_URL}/submit`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ uid, p, name }),
+                        });
+                        const data = await res.json();
+                        if (data.error === 'name_taken') {
+                            const err = document.getElementById('nameError');
+                            err.textContent = 'This name is already taken!';
+                            err.style.display = 'block';
+                            const input = document.getElementById('nameInput');
+                            input.style.borderColor = '#ff6b6b';
+                            input.style.animation = 'shake 0.4s ease';
+                            setTimeout(() => { input.style.animation = ''; }, 400);
+                            return;
+                        }
+                        if (data.ok) {
+                            container.innerHTML = `
+                                <div class="modal-overlay">
+                                    <div class="modal">
+                                        <h2>Score Submitted!</h2>
+                                        <div class="modal-score">${gameScore.toLocaleString()}</div>
+                                        <p>Welcome to the leaderboard, ${esc(name)}!</p>
+                                        <div class="modal-success">Rank #${data.rank + 1}</div>
+                                    </div>
+                                </div>`;
+                            setTimeout(() => { container.innerHTML = ''; fetchLeaderboard(); }, 3000);
+                        }
+                    } catch (e) {
+                        document.getElementById('nameError').textContent = 'Connection error. Try again.';
+                        document.getElementById('nameError').style.display = 'block';
                     }
-                    await db.collection('scores').doc(uid).set({
-                        name: name, score: gameScore, chapter: gameCh, stage: gameSt
-                    });
-                    container.innerHTML = `
-                        <div class="modal-overlay">
-                            <div class="modal">
-                                <h2>Score Submitted!</h2>
-                                <div class="modal-score">${gameScore.toLocaleString()}</div>
-                                <p>Welcome to the leaderboard, ${esc(name)}!</p>
-                                <div class="modal-success">Rank #${(await getRank(gameScore)) + 1}</div>
-                            </div>
-                        </div>`;
-                    setTimeout(() => { container.innerHTML = ''; fetchLeaderboard(); }, 3000);
                 };
                 document.getElementById('nameInput').onkeydown = (e) => {
                     if (e.key === 'Enter') document.getElementById('nameSubmit').click();
@@ -737,12 +757,12 @@
             }
 
             // Existing user — score not higher
-            if (gameScore <= existing.score) {
+            if (gameScore <= (existing.score || 0)) {
                 container.innerHTML = `
                     <div class="modal-overlay">
                         <div class="modal">
                             <h2>Score Not Higher</h2>
-                            <p>Your current best: <strong>${existing.score.toLocaleString()}</strong></p>
+                            <p>Your current best: <strong>${(existing.score || 0).toLocaleString()}</strong></p>
                             <p>New score: <strong>${gameScore.toLocaleString()}</strong></p>
                             <div class="modal-error">Play harder and beat your record!</div>
                             <div style="margin-top:20px">
@@ -758,7 +778,7 @@
                 <div class="modal-overlay">
                     <div class="modal">
                         <h2>New High Score!</h2>
-                        <p>Previous best: <strong>${existing.score.toLocaleString()}</strong></p>
+                        <p>Previous best: <strong>${(existing.score || 0).toLocaleString()}</strong></p>
                         <div class="modal-score">${gameScore.toLocaleString()}</div>
                         <p>Submit your new record to the leaderboard?</p>
                         <div>
@@ -768,26 +788,40 @@
                     </div>
                 </div>`;
             document.getElementById('confirmSubmit').onclick = async () => {
-                await db.collection('scores').doc(uid).set({
-                    name: existing.name, score: gameScore, chapter: gameCh, stage: gameSt
-                });
-                container.innerHTML = `
-                    <div class="modal-overlay">
-                        <div class="modal">
-                            <h2>Score Updated!</h2>
-                            <div class="modal-score">${gameScore.toLocaleString()}</div>
-                            <div class="modal-success">Rank #${(await getRank(gameScore)) + 1}</div>
-                        </div>
-                    </div>`;
-                setTimeout(() => { container.innerHTML = ''; fetchLeaderboard(); }, 3000);
+                try {
+                    const res = await fetch(`${WORKER_URL}/submit`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid, p, name: existing.name }),
+                    });
+                    const data = await res.json();
+                    if (data.ok) {
+                        container.innerHTML = `
+                            <div class="modal-overlay">
+                                <div class="modal">
+                                    <h2>Score Updated!</h2>
+                                    <div class="modal-score">${gameScore.toLocaleString()}</div>
+                                    <div class="modal-success">Rank #${data.rank + 1}</div>
+                                </div>
+                            </div>`;
+                        setTimeout(() => { container.innerHTML = ''; fetchLeaderboard(); }, 3000);
+                    }
+                } catch (e) {
+                    container.innerHTML = `
+                        <div class="modal-overlay">
+                            <div class="modal">
+                                <h2>Error</h2>
+                                <div class="modal-error">Connection error. Try again.</div>
+                                <div style="margin-top:20px">
+                                    <button class="modal-btn modal-btn-secondary" onclick="document.getElementById('modalContainer').innerHTML=''">Close</button>
+                                </div>
+                            </div>
+                        </div>`;
+                }
             };
             document.getElementById('cancelSubmit').onclick = () => { container.innerHTML = ''; };
         })();
-
-        async function getRank(score) {
-            const snap = await db.collection('scores').where('score', '>', score).get();
-            return snap.size;
-        }
+    </script>
     </script>
 
     <script>
