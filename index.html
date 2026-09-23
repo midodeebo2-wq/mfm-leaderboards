@@ -696,6 +696,7 @@
                             <p>Enter your name to join the leaderboard</p>
                             <input class="modal-input" id="nameInput" maxlength="20" placeholder="Your name..." autofocus>
                             <div>
+                                <button class="modal-btn modal-btn-secondary" id="nameCancel" style="margin-left:0;margin-right:10px">Cancel</button>
                                 <button class="modal-btn modal-btn-primary" id="nameSubmit">Submit</button>
                             </div>
                             <div class="modal-error" id="nameError" style="display:none"></div>
@@ -742,6 +743,7 @@
                         document.getElementById('nameError').style.display = 'block';
                     }
                 };
+                document.getElementById('nameCancel').onclick = () => { container.innerHTML = ''; };
                 document.getElementById('nameInput').onkeydown = (e) => {
                     if (e.key === 'Enter') document.getElementById('nameSubmit').click();
                 };
