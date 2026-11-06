@@ -256,14 +256,32 @@ async function firebaseSet(uid, data, env) {
     });
 }
 
+// List every document in the scores collection, following Firestore pagination.
+async function firebaseListScores(env) {
+    const auth = await getAuthHeader(env);
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
+    const docs = [];
+    let pageToken;
+
+    do {
+        const pageUrl = new URL(baseUrl);
+        pageUrl.searchParams.set('pageSize', '300');
+        if (pageToken) pageUrl.searchParams.set('pageToken', pageToken);
+
+        const res = await fetch(pageUrl, { headers: { 'Authorization': auth } });
+        if (!res.ok) return null;
+        const data = await res.json();
+        docs.push(...(data.documents || []));
+        pageToken = data.nextPageToken;
+    } while (pageToken);
+
+    return docs;
+}
+
 // Check if name is taken
 async function firebaseQueryByName(name, env) {
-    const auth = await getAuthHeader(env);
-    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
-    if (!res.ok) return false;
-    const data = await res.json();
-    const docs = data.documents || [];
+    const docs = await firebaseListScores(env);
+    if (!docs) return false;
     return docs.some(doc => {
         const f = doc.fields || {};
         return f.name?.stringValue === name;
@@ -272,26 +290,18 @@ async function firebaseQueryByName(name, env) {
 
 // Get rank for a score
 async function firebaseGetRank(score, env) {
-    const auth = await getAuthHeader(env);
-    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
-    if (!res.ok) return 0;
-    const data = await res.json();
-    const docs = data.documents || [];
+    const docs = await firebaseListScores(env);
+    if (!docs) return 0;
     return docs.filter(doc => {
         const f = doc.fields || {};
         return parseInt(f.score?.integerValue || '0') > score;
     }).length;
 }
 
-// Get top 100 leaderboard
+// Get the complete leaderboard
 async function firebaseGetLeaderboard(env) {
-    const auth = await getAuthHeader(env);
-    const queryUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/scores`;
-    const res = await fetch(queryUrl, { headers: { 'Authorization': auth } });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const docs = data.documents || [];
+    const docs = await firebaseListScores(env);
+    if (!docs) return [];
     const players = docs.map(doc => {
         const f = doc.fields || {};
         const docId = doc.name ? doc.name.split('/').pop() : '';
@@ -304,5 +314,5 @@ async function firebaseGetLeaderboard(env) {
         };
     });
     players.sort((a, b) => b.score - a.score);
-    return players.slice(0, 100);
+    return players;
 }
